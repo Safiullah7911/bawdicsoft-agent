@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+env/
+.venv/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Data & models
+checkpoints/
+data/
+*.zip
+
+# Runtime data (fresh start on Render)
+users.json
+ip_index.json
+anon_visitors.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.local
