@@ -1,5 +1,5 @@
 """
-BawdicSoft AI Sales Agent — IP + Email dual tracking.
+BawdicSoft AI Sales Agent — IP + Email dual tracking + CORS enabled.
 - Known user: email diya hai
 - Familiar user: email nahi diya, lekin IP 2+ baar aayi
 - Unknown user: pehli baar aa raha hai
@@ -10,6 +10,7 @@ from collections import defaultdict
 
 import torch
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
@@ -19,7 +20,7 @@ USERS_FILE = os.environ.get("USERS_FILE", "./users.json")
 IP_INDEX_FILE = os.environ.get("IP_INDEX_FILE", "./ip_index.json")
 ANON_FILE = os.environ.get("ANON_FILE", "./anon_visitors.json")
 DWELL_TRIGGER_SECONDS = 5
-FAMILIAR_VISIT_THRESHOLD = 2  # 2+ visits = familiar
+FAMILIAR_VISIT_THRESHOLD = 2
 
 SYSTEM = (
     "You are BawdicSoft's AI sales assistant. Qualify visitors and capture "
@@ -33,6 +34,20 @@ SYSTEM = (
 EMAIL_RE = re.compile(r"[\w\.-]+@[\w\.-]+\.\w+")
 
 app = FastAPI(title="BawdicSoft AI Sales Agent")
+
+# ============ CORS — Zaroori! ============
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://bawdicsoft.com",
+        "https://www.bawdicsoft.com",
+        "http://localhost:3000",
+        "http://localhost:8000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 print("Loading model...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
@@ -58,9 +73,9 @@ def save_json(path: str, data):
         print(f"[SAVE] {path} failed: {e}")
 
 # ============ PERSISTENT STORES ============
-USERS: Dict = load_json(USERS_FILE)              # email → {name, interests, ip, last_seen}
-IP_INDEX: Dict = load_json(IP_INDEX_FILE)        # ip → email
-ANON_VISITORS: Dict = load_json(ANON_FILE)       # ip → {visits, top_page, session_ids, ...}
+USERS: Dict = load_json(USERS_FILE)
+IP_INDEX: Dict = load_json(IP_INDEX_FILE)
+ANON_VISITORS: Dict = load_json(ANON_FILE)
 
 # ============ IN-MEMORY STORES ============
 SESSIONS: Dict[str, List[str]] = {}
@@ -74,6 +89,7 @@ PAGE_MESSAGES = {
     "/services": "Looking at our services? Tell me what you're trying to build and I'll point you the right way.",
     "/portfolio": "See something that fits? Happy to walk you through similar projects we've done.",
     "/contact": "Want to get in touch? I can help you figure out the right starting point before you fill the form.",
+    "/contact-us": "Want to get in touch? I can help you figure out the right starting point before you fill the form.",
     "/deep-trace": "Checking out Deep-Trace? Want to integrate AI detection into your platform?",
     "/cybercity": "CyberCity runs free security audits. Need help setting up something similar?",
     "/hashfor": "Looking at Hashfor? We built it to boost SEO rankings with data-driven insights.",
@@ -88,7 +104,6 @@ def get_client_ip(request: Request) -> str:
 
 
 def clean_interest(raw: str) -> str:
-    """Project sentence se sirf keyword nikalo."""
     if not raw:
         return ""
     kws = ["AI chatbot", "chatbot", "blockchain", "CRM", "SEO", "wallet",
@@ -100,20 +115,13 @@ def clean_interest(raw: str) -> str:
 
 
 def detect_user(session_id: str, ip: str) -> Dict:
-    """
-    Returns: {type, name, interests}
-    Types: known | familiar | unknown
-    """
-    # ─── Priority 1: Session mein email hai? ───
     lead = LEADS.get(session_id, {})
     email = lead.get("email")
 
-    # ─── Priority 2: IP_INDEX se email dhundo ───
     if not email and ip in IP_INDEX:
         email = IP_INDEX[ip]
         LEADS.setdefault(session_id, {})["email"] = email
 
-    # ─── Known user ───
     if email and email in USERS:
         u = USERS[email]
         return {
@@ -123,27 +131,21 @@ def detect_user(session_id: str, ip: str) -> Dict:
             "email": email,
         }
 
-    # ─── Familiar (anonymous but repeat IP) ───
     anon = ANON_VISITORS.get(ip, {})
     if anon.get("visits", 0) >= FAMILIAR_VISIT_THRESHOLD:
         return {
-            "type": "familiar",  # model ke liye "known" treat karenge
+            "type": "familiar",
             "name": "",
             "interests": anon.get("top_page", "").strip("/").replace("-", " "),
             "email": "",
         }
 
-    # ─── Unknown ───
     return {"type": "unknown", "name": "", "interests": "", "email": ""}
 
 
 def build_model_input(session_id: str, page: str, context_str: str, ip: str) -> str:
-    """Multi-column input string — training format ke bilkul same."""
     user = detect_user(session_id, ip)
-
-    # Familiar ko bhi "known" treat karo (personalized greeting)
     model_user_type = "known" if user["type"] in ("known", "familiar") else "unknown"
-
     return (
         f"user_type: {model_user_type} | "
         f"user_name: {user['name'] or 'none'} | "
@@ -161,7 +163,10 @@ def generate_reply(model_input: str) -> str:
 
 
 def maybe_capture_lead(session_id, visitor_text, history, page, ip):
+    """Lead capture — email + name detection."""
     lead = LEADS.setdefault(session_id, {})
+
+    # Email detection
     match = EMAIL_RE.search(visitor_text)
     if match:
         lead["email"] = match.group(0)
@@ -170,41 +175,21 @@ def maybe_capture_lead(session_id, visitor_text, history, page, ip):
     is_email = bool(EMAIL_RE.search(visitor_text))
     words = visitor_text.strip().split()
 
-    # ─── FIX: Name detection improved ───
-    # Condition 1: last agent message mein "name" hai
-    # Condition 2: YA email already captured hai + short reply
+    # Name detection (improved)
     should_capture_name = False
     if not is_email and len(words) <= 2 and not any(c.isdigit() for c in visitor_text):
         if "name" in last_agent.lower():
             should_capture_name = True
         elif lead.get("email") and not lead.get("name"):
-            # Email hai, chhota reply aaya — yeh name hai
             should_capture_name = True
 
     if should_capture_name:
         lead["name"] = visitor_text.strip()
 
+    # Project detection
     keywords = ["chatbot", "blockchain", "crm", "seo", "wallet", "nft",
                 "mobile", "defi", "dapp", "ecommerce", "e-commerce"]
     if any(k in visitor_text.lower() for k in keywords) and not lead.get("project"):
-        lead["project"] = visitor_text.strip()
-
-    if lead.get("email") and lead.get("name"):
-        fire_lead_webhooks(session_id, lead, ip)
-    lead = LEADS.setdefault(session_id, {})
-    match = EMAIL_RE.search(visitor_text)
-    if match:
-        lead["email"] = match.group(0)
-
-    last_agent = next((t for t in reversed(history) if t.startswith("agent:")), "")
-    is_email = bool(EMAIL_RE.search(visitor_text))
-
-    if "name" in last_agent.lower() and len(visitor_text.split()) <= 2 and not is_email:
-        lead["name"] = visitor_text.strip()
-
-    keywords = ["chatbot", "blockchain", "crm", "seo", "wallet", "nft",
-                "mobile", "defi", "dapp", "ecommerce", "e-commerce"]
-    if any(k in visitor_text.lower() for k in keywords):
         lead["project"] = visitor_text.strip()
 
     if lead.get("email") and lead.get("name"):
@@ -246,7 +231,6 @@ def pick_proactive_message(page: str, session_id: str, ip: str) -> str:
     if user["type"] == "familiar":
         return f"Welcome back! Still checking our {page.strip('/').replace('-', ' ')} page?"
 
-    # Unknown
     if page in PAGE_MESSAGES:
         return PAGE_MESSAGES[page]
     for known_page, msg in PAGE_MESSAGES.items():
@@ -290,7 +274,6 @@ def chat(req: ChatRequest, request: Request):
         history.append(f"visitor: {msg}")
         maybe_capture_lead(req.session_id, msg, history, req.page, ip)
 
-    # Known/familiar user ka first message → personalized greeting
     user = detect_user(req.session_id, ip)
 
     if is_first_message and user["type"] == "known":
@@ -338,9 +321,8 @@ async def track(req: TrackRequest, request: Request):
         if req.session_id not in av["session_ids"]:
             av["visits"] += 1
             av["session_ids"].append(req.session_id)
-            av["session_ids"] = av["session_ids"][-10:]  # keep last 10
+            av["session_ids"] = av["session_ids"][-10:]
 
-    # Update top page for this session
     pages = PAGE_DWELL[req.session_id]
     if pages:
         ANON_VISITORS[ip]["top_page"] = max(pages, key=pages.get)
