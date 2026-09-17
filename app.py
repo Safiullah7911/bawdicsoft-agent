@@ -158,7 +158,7 @@ def build_model_input(session_id: str, page: str, context_str: str, ip: str) -> 
 def generate_reply(model_input: str) -> str:
     ids = tokenizer(model_input, return_tensors="pt", truncation=True, max_length=512)
     with torch.no_grad():
-        out = model.generate(**ids, max_new_tokens=48, num_beams=3, no_repeat_ngram_size=2)
+        out = model.generate(**ids, max_new_tokens=20, num_beams=1, no_repeat_ngram_size=2)
     return tokenizer.decode(out[0], skip_special_tokens=True).strip()
 
 
