@@ -3,13 +3,24 @@ BawdicSoft AI Sales Agent — IP + Email dual tracking + CORS enabled + Lead for
 - Known user: email diya hai
 - Familiar user: email nahi diya, lekin IP 2+ baar aayi
 - Unknown user: pehli baar aa raha hai
+
+Speed optimizations:
+- torch.set_num_threads(1) — Render free tier 1 CPU ke liye
+- Model quantization (int8) — 2-3x faster
+- LRU cache — common replies instant
 """
 import os, re, json, time
 from typing import Dict, List
 from collections import defaultdict
+from functools import lru_cache
 
 import requests
 import torch
+
+# ─── CPU Threads Optimize (Render = 1 CPU) ───
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -53,11 +64,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ============ MODEL LOAD + QUANTIZE ============
 print("Loading model...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
 model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_DIR)
+
+print("Quantizing model (int8)...")
+model = torch.quantization.quantize_dynamic(
+    model,
+    {torch.nn.Linear},
+    dtype=torch.qint8,
+)
 model.eval()
-print("Model loaded OK")
+print("Model loaded + quantized OK ⚡")
 
 # ============ PERSISTENT STORAGE HELPERS ============
 def load_json(path: str) -> Dict:
@@ -159,27 +178,41 @@ def build_model_input(session_id: str, page: str, context_str: str, ip: str) -> 
     )
 
 
-def generate_reply(model_input: str) -> str:
-    ids = tokenizer(model_input, return_tensors="pt", truncation=True, max_length=512)
+# ============ FAST GENERATE + CACHE ============
+@lru_cache(maxsize=1000)
+def _generate_reply_cached(model_input: str) -> str:
+    """Cache common inputs — same question dobara aaye toh instant reply."""
+    ids = tokenizer(model_input, return_tensors="pt", truncation=True, max_length=384)
     with torch.no_grad():
-        out = model.generate(**ids, max_new_tokens=20, num_beams=1, no_repeat_ngram_size=2)
+        out = model.generate(
+            **ids,
+            max_new_tokens=16,
+            num_beams=1,
+            do_sample=False,
+            no_repeat_ngram_size=2,
+            early_stopping=True,
+        )
     return tokenizer.decode(out[0], skip_special_tokens=True).strip()
+
+
+def generate_reply(model_input: str) -> str:
+    return _generate_reply_cached(model_input)
 
 
 def maybe_capture_lead(session_id, visitor_text, history, page, ip):
     """Lead capture — email + name detection."""
     lead = LEADS.setdefault(session_id, {})
 
-    # Email detection
+    # Email detection (lowercase for consistency)
     match = EMAIL_RE.search(visitor_text)
     if match:
-        lead["email"] = match.group(0)
+        lead["email"] = match.group(0).lower()
 
     last_agent = next((t for t in reversed(history) if t.startswith("agent:")), "")
     is_email = bool(EMAIL_RE.search(visitor_text))
     words = visitor_text.strip().split()
 
-    # Name detection (improved)
+    # Name detection
     should_capture_name = False
     if not is_email and len(words) <= 2 and not any(c.isdigit() for c in visitor_text):
         if "name" in last_agent.lower():
@@ -208,6 +241,9 @@ def fire_lead_webhooks(session_id, lead, ip, page="/"):
     if not email:
         return
 
+    # Normalize email (lowercase)
+    email = email.lower()
+
     # ─── Save locally ───
     USERS[email] = {
         "name": lead.get("name", ""),
@@ -222,7 +258,7 @@ def fire_lead_webhooks(session_id, lead, ip, page="/"):
     save_json(IP_INDEX_FILE, IP_INDEX)
     print(f"[USER SAVED] {email} | ip={ip}")
 
-    # ─── Forward to frontend (Airtable + Email) ───
+    # ─── Forward to frontend ───
     payload = {
         "visitorId": session_id,
         "email": email,
@@ -422,7 +458,6 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
 
 
 
